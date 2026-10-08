@@ -45,12 +45,15 @@ public class V850Emu extends GhidraScript {
         }
         println("[inj] buf353="+buf353+" buf128="+buf128+" buf307="+buf307+" buf313="+buf313+" freeRx="+freeRx);
 
-        // ---- inject 0x353 (ambient = byte4) ----
-        inject("0x353 HVAC", buf353>=0?buf353:(freeRx>=0?freeRx:1), 0x353,
-               new int[]{0x11,0x22,0xA2,0xA3,0x5A,0xA5,0xA6,0x77});
-        // ---- inject 0x128 (illum = byte1) ----
-        inject("0x128 Illum", buf128>=0?buf128:(freeRx>=0?freeRx:1), 0x128,
-               new int[]{0x11,0xD6,0x33,0x44,0x55,0x66,0x77,0x88});
+        // Program buffer MIDs from the ROM table (flash 0x6a80->bin 0x2980) so routing is sane.
+        for (int n=3;n<32;n++){ int midh=img8(0x6a80+(n-3)*2)|(img8(0x6a80+(n-3)*2+1)<<8);
+            try{ emu.writeMemory(toAddr(0x3FEC10CL+n*0x20L), new byte[]{(byte)(midh&0xff),(byte)((midh>>8)&0xff)});}catch(Exception e){} }
+
+        // ---- inject 0x128 (illum=byte1) at TWO levels; diff which SFR/var tracks it ----
+        inject("0x128 illum=0x20", 29, 0x128, new int[]{0x00,0x20,0x00,0xFF,0x00,0x00,0x00,0x00});
+        inject("0x128 illum=0xE0", 29, 0x128, new int[]{0x00,0xE0,0x00,0xFF,0x00,0x00,0x00,0x00});
+        // ---- inject 0x353 (ambient=byte4) ----
+        inject("0x353 ambient=0x5A", 12, 0x353, new int[]{0x11,0x22,0xA2,0xA3,0x5A,0xA5,0xA6,0x77});
 
         emu.dispose();
     }
