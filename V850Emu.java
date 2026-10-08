@@ -59,34 +59,36 @@ public class V850Emu extends GhidraScript {
     }
 
     void inject(String label, int bufIdx, int canId, int[] data) {
-        println("\n[inj] ===== "+label+" into buf["+bufIdx+"] id=0x"+hex(canId)+" =====");
+        println("\n[inj] ===== "+label+" buf["+bufIdx+"] markers["+markers(data)+"] =====");
         long base=0x3FEC100L+bufIdx*0x20;
-        byte[] before = snap(0x03FF0000L, 0xC000);
+        byte[] ramB=snap(0x03FF0000L,0xC000), sfrB=snap(0xFFFFF000L,0x1000), ppaB=snap(0x03FEC000L,0x1000);
         try {
             for (int i=0;i<8;i++) emu.writeMemory(toAddr(base+i), new byte[]{(byte)data[i]});
             int midh=(canId<<2)&0xFFFF;
             emu.writeMemory(toAddr(base+0x0C), new byte[]{(byte)(midh&0xff),(byte)((midh>>8)&0xff)});
-            emu.writeMemory(toAddr(base+0x08), new byte[]{8,0});  // DLC
-            emu.writeMemory(toAddr(base+0x0E), new byte[]{0x01,0}); // RX complete / data frame received
+            emu.writeMemory(toAddr(base+0x08), new byte[]{8,0});
+            emu.writeMemory(toAddr(base+0x0E), new byte[]{0x01,0});
         } catch(Exception e){ println("  setup err "+e); }
-
-        boolean oldStub=afcanStub; afcanStub=false;   // don't wipe the buffer we just set
-        callFn(0x114C2L+0x4100L, bufIdx);              // FUN_000114c2(bufIdx)
-        afcanStub=oldStub;
-
-        byte[] after = snap(0x03FF0000L, 0xC000);
-        int changes=0;
-        println("  RAM changes (addr: before->after)  [data markers: "+markers(data)+"]");
-        for (int i=0;i<after.length && changes<80;i++){
-            if (after[i]!=before[i]){
-                long a=0x03FF0000L+i; int nv=after[i]&0xff, ov=before[i]&0xff;
-                String tag="";
-                for (int k=0;k<8;k++) if (nv==(data[k]&0xff) && data[k]!=0x11) tag=" <= frame byte"+k;
-                println(String.format("    0x%08x: %02x -> %02x%s",a,ov,nv,tag));
-                changes++;
+        boolean old=afcanStub; afcanStub=false;
+        callFn(0x114C2L+0x4100L, bufIdx);
+        long st=0; while(st<400000){ int r=advance(); if(r==2) break; if(r==0) st++; }   // let reactive update run
+        afcanStub=old;
+        diff("RAM",0x03FF0000L,ramB,snap(0x03FF0000L,0xC000),data);
+        diff("SFR",0xFFFFF000L,sfrB,snap(0xFFFFF000L,0x1000),data);
+        diff("PPA",0x03FEC000L,ppaB,snap(0x03FEC000L,0x1000),data);
+    }
+    void diff(String tag,long base,byte[]b,byte[]a,int[]data){
+        int c=0; int b1=data[1]&0xff;
+        for(int i=0;i<a.length && c<50;i++){
+            if(a[i]!=b[i]){
+                int nv=a[i]&0xff, ov=b[i]&0xff; String t="";
+                for(int k=0;k<8;k++) if(data[k]!=0 && nv==(data[k]&0xff)) t+=" =frameB"+k;
+                if(nv==((0xff-b1)&0xff)) t+=" =~(0xff-illum)";
+                if(nv==((0x1f-(b1&0x1f))&0xff)) t+=" =~(0x1f-illum5)";
+                println(String.format("    %s 0x%08x: %02x->%02x%s",tag,base+i,ov,nv,t)); c++;
             }
         }
-        println("  total changed bytes: "+countDiff(before,after));
+        println("  "+tag+" changed="+countDiff(b,a));
     }
 
     String markers(int[] d){ StringBuilder s=new StringBuilder(); for(int i=0;i<8;i++) s.append("b"+i+"=0x"+hex(d[i]&0xff)+" "); return s.toString(); }
