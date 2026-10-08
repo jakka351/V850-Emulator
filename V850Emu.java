@@ -1,6 +1,6 @@
-// V850Emu.java — emulate the Mk2 FDIM startup+main-init so the computed-base init runs,
-// hand-executing CALLT/CTRET (Ghidra's V850 pcode mishandles them), then dump the LIVE
-// CAN signal dispatch tables (0x03FF0318 / 0x03FF03A4).
+// V850Emu.java — emulate FDIM startup+init, then INJECT CAN frames into the AFCAN RX
+// pipeline and diff RAM to map which variable each signal byte lands in.
+// Firmware linked for flash base 0x4100 (load image at 0x4100). CALLT/CTRET hand-executed.
 // @category FDIM
 import ghidra.app.script.GhidraScript;
 import ghidra.app.emulator.EmulatorHelper;
@@ -8,136 +8,130 @@ import ghidra.program.model.address.Address;
 import java.math.BigInteger;
 
 public class V850Emu extends GhidraScript {
-
-    long maxSteps = 8_000_000L;
     EmulatorHelper emu;
+    long callts=0, ctrets=0;
+    final long SENT = 0x7FFFFFFEL;
+    boolean afcanStub = true;
 
     @Override
     public void run() throws Exception {
-        if (getScriptArgs().length > 0) { try { maxSteps = Long.parseLong(getScriptArgs()[0]); } catch (Exception e) {} }
+        long initSteps = 160000;
+        if (getScriptArgs().length>0){ try{ initSteps=Long.parseLong(getScriptArgs()[0]); }catch(Exception e){} }
         emu = new EmulatorHelper(currentProgram);
-
-        zero(0x03FF0000L, 0x10000); zero(0x03FE0000L, 0x10000); zero(0xFFFF0000L, 0x10000);
-        emu.writeMemory(toAddr(0xFFFFF6C2L), new byte[]{ 0x01 });   // clock/PLL lock bit
-
-        emu.writeRegister(emu.getPCRegister(), BigInteger.valueOf(0x4100L));  // flash base 0x4100
+        zero(0x03FF0000L,0x10000); zero(0x03FE0000L,0x10000); zero(0xFFFF0000L,0x10000);
+        emu.writeMemory(toAddr(0xFFFFF6C2L), new byte[]{1});
+        emu.writeRegister(emu.getPCRegister(), BigInteger.valueOf(0x4100L));
         wr("sp",0x03FFEFACL); wr("gp",0x03FF7C64L); wr("tp",0x0000B4A8L);
 
-        long[] ring = new long[96]; int ri = 0;
-        long steps=0, callts=0, ctrets=0; boolean populated=false; final long CHECK=50_000L;
-        println("[emu] start; maxSteps="+maxSteps+"  CTBP(init)=0x"+hex(reg("CTBP")));
-        try {
-            while (steps < maxSteps) {
-                long p = pc(); ring[ri++ % 96] = p;
-                // AFCAN peripheral model: controller acks mode/buffer requests immediately.
-                // Clear the message-buffer ctrl 'busy/request' bits so write-1-wait-for-clear polls exit.
-                if (p >= 0x14C00L && p <= 0x15700L) {
-                    for (long n=0; n<32; n++) emu.writeMemory(toAddr(0x03FEC10EL + n*0x20L), new byte[]{0,0});
-                    emu.writeMemory(toAddr(0x03FEC000L), new byte[]{0,0});   // global ctrl/status
-                }
-                int b0 = img8(p), b1 = img8(p+1); int hw = b0 | (b1<<8);
+        println("[emu] init run, "+initSteps+" steps");
+        long st=0;
+        while (st<initSteps){ int r=advance(); if(r==2){ println("[emu] halt during init @0x"+hex(pc())); break; } if(r==0) st++; }
+        println("[emu] init done steps="+st+" callt="+callts+" ctret="+ctrets+" pc=0x"+hex(pc()));
 
-                // ---- CALLT imm6 : target = CTBP + u16[CTBP + imm6*2];  save ret in CTPC ----
-                if ((hw & 0xFFC0) == 0x0200) {
-                    int imm6 = hw & 0x3F; long ctbp = reg("CTBP");
-                    long ent = img16(ctbp + imm6*2L);
-                    long tgt = (ctbp + ent) & 0xFFFFFFFEL;   // mask bit0 (PC always even)
-                    wr("CTPC", (p+2) & 0xFFFFFFFFL);
-                    emu.writeRegister(emu.getPCRegister(), BigInteger.valueOf(tgt));
-                    if (callts++ < 24) println("[emu] CALLT "+imm6+" @0x"+hex(p)+" ctbp=0x"+hex(ctbp)+" ent=0x"+hex(ent)+" -> 0x"+hex(tgt));
-                    continue;
-                }
-                // ---- CTRET : PC = CTPC ----  (encoding 0x07E0 0x0144 => bytes E0 07 44 01)
-                if (b0==0xE0 && b1==0x07 && img8(p+2)==0x44 && img8(p+3)==0x01) {
-                    long ctpc = reg("CTPC");
-                    emu.writeRegister(emu.getPCRegister(), BigInteger.valueOf(ctpc & 0xFFFFFFFFL));
-                    ctrets++;
-                    continue;
-                }
-
-                if (p < 0x4100L || (p >= 0x40000L && p < 0x03FF0000L)) { println("[emu] PC escaped: 0x"+hex(p)+" step "+steps); break; }
-                if (!emu.step(monitor)) { println("[emu] step=false @"+steps+" pc=0x"+hex(pc())); break; }
-                steps++;
-                if (steps % CHECK == 0) {
-                    long sapA=rd32(0x03FF0320L), sapB=rd32(0x03FF03ACL);
-                    println("[emu] steps="+steps+" pc=0x"+hex(pc())+" callt="+callts+" ctret="+ctrets+" sapA=0x"+hex(sapA)+" sapB=0x"+hex(sapB));
-                    if (looksPtr(sapA)||looksPtr(sapB)) populated=true;
-                    if (populated && steps % (CHECK*6)==0) break;
-                }
-            }
-        } catch (Throwable t) {
-            println("[emu] stopped: "+t.getClass().getSimpleName()+" "+t.getMessage()+" @"+steps+" pc=0x"+hex(pc()));
+        // ---- AFCAN buffer MID map (which buffer carries which CAN id) ----
+        println("\n[inj] AFCAN buffer MIDs after init:");
+        int buf353=-1, buf128=-1, buf307=-1, buf313=-1, freeRx=-1;
+        for (int n=0;n<32;n++){
+            long base=0x3FEC100L+n*0x20;
+            int midh = erd8(base+0x0C) | (erd8(base+0x0D)<<8);
+            int id = (midh>>2) & 0x7FF;
+            int cfg = erd8(base+9);
+            if (midh!=0 || cfg!=0) println(String.format("  buf[%2d] MIDH=0x%04x id=0x%03x cfg=0x%02x",n,midh,id,cfg));
+            if (id==0x353) buf353=n;
+            if (id==0x128) buf128=n;
+            if (id==0x307) buf307=n;
+            if (id==0x313) buf313=n;
+            if (cfg!=0 && id==0 && freeRx<0) freeRx=n;
         }
-        StringBuilder sb=new StringBuilder();
-        for (int k=0;k<96;k++){ long v=ring[(ri+k)%96]; if(v!=0) sb.append(hex(v)).append(" "); }
-        println("[emu] trace: "+sb);
-        println("[emu] done steps="+steps+" callt="+callts+" ctret="+ctrets+" populated="+populated+" pc=0x"+hex(pc()));
+        println("[inj] buf353="+buf353+" buf128="+buf128+" buf307="+buf307+" buf313="+buf313+" freeRx="+freeRx);
 
-        dumpTable("TABLE A @0x03FF0318 (20B recs)", 0x03FF0318L, 20, 8);
-        dumpTable("TABLE B @0x03FF03A4 (24B recs)", 0x03FF03A4L, 24, 12);
-        rawDump("RAM 0x03ff0300", 0x03FF0300L, 0x140);
-        rawDump("RAM 0x03ff03a0", 0x03FF03A0L, 0x120);
-        scanRam();
+        // ---- inject 0x353 (ambient = byte4) ----
+        inject("0x353 HVAC", buf353>=0?buf353:(freeRx>=0?freeRx:1), 0x353,
+               new int[]{0x11,0x22,0xA2,0xA3,0x5A,0xA5,0xA6,0x77});
+        // ---- inject 0x128 (illum = byte1) ----
+        inject("0x128 Illum", buf128>=0?buf128:(freeRx>=0?freeRx:1), 0x128,
+               new int[]{0x11,0xD6,0x33,0x44,0x55,0x66,0x77,0x88});
+
         emu.dispose();
     }
 
-    void wr(String n,long v){ try{ emu.writeRegister(n, BigInteger.valueOf(v & 0xFFFFFFFFL)); }catch(Exception e){} }
-    long reg(String n){ try{ return emu.readRegister(n).longValue() & 0xFFFFFFFFL; }catch(Exception e){ return 0; } }
-    void zero(long base,int len){ emu.writeMemory(toAddr(base), new byte[len]); }
-    long pc(){ return emu.readRegister(emu.getPCRegister()).longValue() & 0xFFFFFFFFL; }
-    boolean looksPtr(long v){ return (v>=0x4100L && v<0x40000L) || (v>=0x03FF0000L && v<=0x03FFFFFFL); }
+    void inject(String label, int bufIdx, int canId, int[] data) {
+        println("\n[inj] ===== "+label+" into buf["+bufIdx+"] id=0x"+hex(canId)+" =====");
+        long base=0x3FEC100L+bufIdx*0x20;
+        byte[] before = snap(0x03FF0000L, 0xC000);
+        try {
+            for (int i=0;i<8;i++) emu.writeMemory(toAddr(base+i), new byte[]{(byte)data[i]});
+            int midh=(canId<<2)&0xFFFF;
+            emu.writeMemory(toAddr(base+0x0C), new byte[]{(byte)(midh&0xff),(byte)((midh>>8)&0xff)});
+            emu.writeMemory(toAddr(base+0x08), new byte[]{8,0});  // DLC
+            emu.writeMemory(toAddr(base+0x0E), new byte[]{0x01,0}); // RX complete / data frame received
+        } catch(Exception e){ println("  setup err "+e); }
+
+        boolean oldStub=afcanStub; afcanStub=false;   // don't wipe the buffer we just set
+        callFn(0x114C2L+0x4100L, bufIdx);              // FUN_000114c2(bufIdx)
+        afcanStub=oldStub;
+
+        byte[] after = snap(0x03FF0000L, 0xC000);
+        int changes=0;
+        println("  RAM changes (addr: before->after)  [data markers: "+markers(data)+"]");
+        for (int i=0;i<after.length && changes<80;i++){
+            if (after[i]!=before[i]){
+                long a=0x03FF0000L+i; int nv=after[i]&0xff, ov=before[i]&0xff;
+                String tag="";
+                for (int k=0;k<8;k++) if (nv==(data[k]&0xff) && data[k]!=0x11) tag=" <= frame byte"+k;
+                println(String.format("    0x%08x: %02x -> %02x%s",a,ov,nv,tag));
+                changes++;
+            }
+        }
+        println("  total changed bytes: "+countDiff(before,after));
+    }
+
+    String markers(int[] d){ StringBuilder s=new StringBuilder(); for(int i=0;i<8;i++) s.append("b"+i+"=0x"+hex(d[i]&0xff)+" "); return s.toString(); }
+    int countDiff(byte[]a,byte[]b){ int c=0; for(int i=0;i<a.length;i++) if(a[i]!=b[i])c++; return c; }
+    byte[] snap(long base,int len){ try{ return emu.readMemory(toAddr(base),len);}catch(Exception e){ return new byte[len]; } }
+
+    void callFn(long entry, long arg){
+        wr("r6", arg); wr("r31", SENT);
+        emu.writeRegister(emu.getPCRegister(), BigInteger.valueOf(entry));
+        long cap=4_000_000, st=0;
+        while (st<cap){
+            long p=pc();
+            if (p==SENT || p==(SENT&0xFFFFFFFEL)){ println("  [call] returned after "+st+" steps"); return; }
+            int r=advance();
+            if (r==2){ println("  [call] halt @0x"+hex(pc())+" after "+st); return; }
+            if (r==0) st++;
+        }
+        println("  [call] hit step cap, pc=0x"+hex(pc()));
+    }
+
+    // one engine step: handle CALLT/CTRET/AFCAN, else emu.step. returns 0=stepped,1=handled,2=halt
+    int advance(){
+        long p=pc();
+        if (afcanStub && p>=0x14C00L && p<=0x15700L){
+            try{ for(long n=0;n<32;n++) emu.writeMemory(toAddr(0x03FEC10EL+n*0x20L),new byte[]{0,0});
+                 emu.writeMemory(toAddr(0x03FEC000L),new byte[]{0,0}); }catch(Exception e){}
+        }
+        int b0=img8(p), b1=img8(p+1); int hw=b0|(b1<<8);
+        if ((hw&0xFFC0)==0x0200){ // CALLT
+            int imm=hw&0x3F; long ctbp=reg("CTBP"); long ent=img16(ctbp+imm*2L);
+            long tgt=(ctbp+ent)&0xFFFFFFFEL; wr("CTPC",(p+2)&0xFFFFFFFFL);
+            emu.writeRegister(emu.getPCRegister(), BigInteger.valueOf(tgt)); callts++; return 1;
+        }
+        if (b0==0xE0 && b1==0x07 && img8(p+2)==0x44 && img8(p+3)==0x01){ // CTRET
+            long ctpc=reg("CTPC"); emu.writeRegister(emu.getPCRegister(), BigInteger.valueOf(ctpc&0xFFFFFFFFL)); ctrets++; return 1;
+        }
+        if (p==SENT || p==(SENT&0xFFFFFFFEL)) return 2;
+        if (p<0x4100L || (p>=0x40000L && p<0x03FF0000L)){ println("[emu] PC escaped 0x"+hex(p)); return 2; }
+        try{ if(!emu.step(monitor)){ return 2; } }catch(Throwable t){ println("[emu] ex "+t.getMessage()+" @0x"+hex(p)); return 2; }
+        return 0;
+    }
+
+    void wr(String n,long v){ try{ emu.writeRegister(n,BigInteger.valueOf(v&0xFFFFFFFFL)); }catch(Exception e){} }
+    long reg(String n){ try{ return emu.readRegister(n).longValue()&0xFFFFFFFFL; }catch(Exception e){ return 0; } }
+    void zero(long b,int l){ emu.writeMemory(toAddr(b),new byte[l]); }
+    long pc(){ return emu.readRegister(emu.getPCRegister()).longValue()&0xFFFFFFFFL; }
     String hex(long v){ return Long.toHexString(v); }
-    int img8(long a){ try{ return getByte(toAddr(a)) & 0xff; }catch(Exception e){ try{ return emu.readMemory(toAddr(a),1)[0]&0xff; }catch(Exception e2){ return 0; } } }
-    long img16(long a){ return img8(a) | (img8(a+1)<<8); }
-    long rd32(long a){ try{ byte[] b=emu.readMemory(toAddr(a),4); return (b[0]&0xffL)|((b[1]&0xffL)<<8)|((b[2]&0xffL)<<16)|((b[3]&0xffL)<<24);}catch(Exception e){return -1;} }
-    int erd8(long a){ try{ return emu.readMemory(toAddr(a),1)[0]&0xff; }catch(Exception e){ return -1; } }
-
-    void rawDump(String title, long base, int len){
-        println("\n== "+title+" ==");
-        for (int o=0;o<len;o+=16){
-            StringBuilder sb=new StringBuilder(String.format("  %08x: ",base+o));
-            for (int k=0;k<16;k++) sb.append(String.format("%02x ", erd8(base+o+k)));
-            println(sb.toString());
-        }
-    }
-    // scan RAM for live signal-entry arrays {descPtr(flash), destRAM, sizeType(1/2/4), cb(0|flash)}
-    void scanRam(){
-        println("\n== RAM scan for signal-entry arrays {descPtr,destRAM,size,cb} ==");
-        long lo=0x03FF0000L, hi=0x03FFE000L; int found=0;
-        for (long a=lo; a<hi && found<60; a+=4){
-            int run=0; long p=a;
-            while (p+16<=hi){
-                long w0=rd32(p),w1=rd32(p+4),w2=rd32(p+8),w3=rd32(p+12);
-                boolean romp=(w0>=0x4100L&&w0<0x40000L), ramp=(w1>=0x03FF0000L&&w1<=0x03FFFFFFL), sz=(w2==1||w2==2||w2==4), cbp=(w3==0||(w3>=0x4100L&&w3<0x40000L));
-                if (romp&&ramp&&sz&&cbp){ run++; p+=16; } else break;
-            }
-            if (run>=4){
-                println(String.format("  array @0x%08x x%d:",a,run));
-                for (int s=0;s<Math.min(run,12);s++){
-                    long e=a+(long)s*16; long dp=rd32(e),dest=rd32(e+4),szt=rd32(e+8),cb=rd32(e+12);
-                    int off=erd8(dp),sh=erd8(dp+1),ln=erd8(dp+2);
-                    println(String.format("     [%d] desc=0x%x {off=%d,sh=%d,len=%d} dest=0x%x sz=%d cb=0x%x",s,dp,off,sh,ln,dest,szt,cb));
-                }
-                found++; a+=run*16;
-            }
-        }
-        if (found==0) println("  (none)");
-    }
-
-    void dumpTable(String title,long base,int recSize,int maxRec){
-        println("\n==== "+title+" ====");
-        for (int r=0;r<maxRec;r++){
-            long rec=base+(long)r*recSize;
-            int k0=erd8(rec),k1=erd8(rec+1),cnt=erd8(rec+2); int len=erd8(rec+4)|(erd8(rec+5)<<8);
-            long sap=rd32(rec+8);
-            if (k0==0&&k1==0&&cnt==0&&sap==0) continue;
-            println(String.format("  rec[%d] key=%02x %02x count=%d len=%d sap=0x%x",r,k0,k1,cnt,len,sap));
-            if (!looksPtr(sap)||cnt<=0||cnt>64) continue;
-            for (int s=0;s<cnt;s++){
-                long e=sap+(long)s*0x10; long dp=rd32(e),dest=rd32(e+4),sz=rd32(e+8),cb=rd32(e+12);
-                int off=-1,sh=-1,ln=-1; if(looksPtr(dp)){off=erd8(dp);sh=erd8(dp+1);ln=erd8(dp+2);}
-                println(String.format("      sig[%d] desc=0x%x {off=%d,sh=%d,len=%d} dest=0x%x sz=%d cb=0x%x",s,dp,off,sh,ln,dest,sz,cb));
-            }
-        }
-    }
+    int img8(long a){ try{ return getByte(toAddr(a))&0xff;}catch(Exception e){ try{return emu.readMemory(toAddr(a),1)[0]&0xff;}catch(Exception e2){return 0;} } }
+    long img16(long a){ return img8(a)|(img8(a+1)<<8); }
+    int erd8(long a){ try{ return emu.readMemory(toAddr(a),1)[0]&0xff;}catch(Exception e){return 0;} }
 }
