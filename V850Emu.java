@@ -75,6 +75,9 @@ public class V850Emu extends GhidraScript {
 
         dumpTable("TABLE A @0x03FF0318 (20B recs)", 0x03FF0318L, 20, 8);
         dumpTable("TABLE B @0x03FF03A4 (24B recs)", 0x03FF03A4L, 24, 12);
+        rawDump("RAM 0x03ff0300", 0x03FF0300L, 0x140);
+        rawDump("RAM 0x03ff03a0", 0x03FF03A0L, 0x120);
+        scanRam();
         emu.dispose();
     }
 
@@ -88,6 +91,38 @@ public class V850Emu extends GhidraScript {
     long img16(long a){ return img8(a) | (img8(a+1)<<8); }
     long rd32(long a){ try{ byte[] b=emu.readMemory(toAddr(a),4); return (b[0]&0xffL)|((b[1]&0xffL)<<8)|((b[2]&0xffL)<<16)|((b[3]&0xffL)<<24);}catch(Exception e){return -1;} }
     int erd8(long a){ try{ return emu.readMemory(toAddr(a),1)[0]&0xff; }catch(Exception e){ return -1; } }
+
+    void rawDump(String title, long base, int len){
+        println("\n== "+title+" ==");
+        for (int o=0;o<len;o+=16){
+            StringBuilder sb=new StringBuilder(String.format("  %08x: ",base+o));
+            for (int k=0;k<16;k++) sb.append(String.format("%02x ", erd8(base+o+k)));
+            println(sb.toString());
+        }
+    }
+    // scan RAM for live signal-entry arrays {descPtr(flash), destRAM, sizeType(1/2/4), cb(0|flash)}
+    void scanRam(){
+        println("\n== RAM scan for signal-entry arrays {descPtr,destRAM,size,cb} ==");
+        long lo=0x03FF0000L, hi=0x03FFE000L; int found=0;
+        for (long a=lo; a<hi && found<60; a+=4){
+            int run=0; long p=a;
+            while (p+16<=hi){
+                long w0=rd32(p),w1=rd32(p+4),w2=rd32(p+8),w3=rd32(p+12);
+                boolean romp=(w0>=0x4100L&&w0<0x40000L), ramp=(w1>=0x03FF0000L&&w1<=0x03FFFFFFL), sz=(w2==1||w2==2||w2==4), cbp=(w3==0||(w3>=0x4100L&&w3<0x40000L));
+                if (romp&&ramp&&sz&&cbp){ run++; p+=16; } else break;
+            }
+            if (run>=4){
+                println(String.format("  array @0x%08x x%d:",a,run));
+                for (int s=0;s<Math.min(run,12);s++){
+                    long e=a+(long)s*16; long dp=rd32(e),dest=rd32(e+4),szt=rd32(e+8),cb=rd32(e+12);
+                    int off=erd8(dp),sh=erd8(dp+1),ln=erd8(dp+2);
+                    println(String.format("     [%d] desc=0x%x {off=%d,sh=%d,len=%d} dest=0x%x sz=%d cb=0x%x",s,dp,off,sh,ln,dest,szt,cb));
+                }
+                found++; a+=run*16;
+            }
+        }
+        if (found==0) println("  (none)");
+    }
 
     void dumpTable(String title,long base,int recSize,int maxRec){
         println("\n==== "+title+" ====");
